@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<head>
+    <meta charset="utf-8">
+    <title>income blockchain</title>
+</head>
+<body>
+    <table border="1">
+        <tr>
+            <td>版本</td>
+            <td>前一区块哈希值</td>
+            <td>盈亏</td>
+            <td>哈希值</td>
+            <td>时间</td>
+        </tr>
+        {{range .Blocks}}
+        <tr>
+            <td>{{.Version}}</td>
+            <td>{{.PrevBlockHash | $.HashToString}}</td>
+            <td>{{.Income}}</td>
+            <td>{{.Hash | $.HashToString}}</td>
+            <td>{{.TimeStamp | $.TimeStampToString}}</td>
+        </tr>
+        
+        {{end}}
+    </table>
+
+    <form action="/" method="POST">
+        <label>盈亏: </label>
+        <input type="text" placeholder="输入盈亏数" name="income"/>
+        <input type="submit" value="添加区块"/>
+    </form>
+</body>
