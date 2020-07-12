@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<head>
+    <meta charset="utf-8">
+    <title>income blockchain</title>
+</head>
+<body>
+    <table border="1">
+        <tr>
+            <td>标号</td>
+            <td>版本</td>
+            <td>前一区块哈希值</td>
+            <td>数据</td>
+            <td>哈希值</td>
+            <td>时间</td>
+        </tr>
+        {{range .Blocks}}
+        <tr>
+            <td>{{.Index}}</td>
+            <td>{{.Version}}</td>
+            <td>{{.PrevHash | $.HashToString}}</td>
+            <td>{{.Data}}</td>
+            <td>{{.Hash | $.HashToString}}</td>
+            <td>{{.TimeStamp | $.TimeStampToString}}</td>
+        </tr>
+        
+        {{end}}
+    </table>
+
+    <form action="/" method="POST">
+        <label>上链数据: </label>
+        <input type="text" placeholder="输入数据" name="data"/>
+        <input type="submit" value="添加区块"/>
+    </form>
+</body>

@@ -26,6 +26,13 @@ func (blockchain *Blockchain) AddBlock(data string) {
 	mutex.Unlock()
 }
 
+// AppendBlock 增加一个区块到链末
+func (blockchain *Blockchain) AppendBlock(block *Block) {
+	mutex.Lock()
+	blockchain.Blocks = append(blockchain.Blocks, block)
+	mutex.Unlock()
+}
+
 // ReplaceChain 替换当前区块链
 func (blockchain *Blockchain) ReplaceChain(newBlocks []*Block) {
 	mutex.Lock()

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"p2pFirst/blockchain"
 	"strings"
 	"time"
 )
@@ -13,9 +14,12 @@ type Peer struct {
 	apiHTTPAddr    string
 	peerAddr       string
 	otherPeersAddr string
+	alivePeersAddr []string
 }
 
 var MyPeer Peer
+
+var MyBlockchain *blockchain.Blockchain
 
 func init() {
 	flag.StringVar(&MyPeer.apiHTTPAddr, "api", "", "api http server address")
@@ -23,6 +27,7 @@ func init() {
 	flag.StringVar(&MyPeer.otherPeersAddr, "peers", "", "other peers address")
 	flag.Parse()
 
+	MyBlockchain = blockchain.NewBlockchain()
 	MyPeer.connectToPeers()
 	MyPeer.startServer()
 }
@@ -40,9 +45,8 @@ func (peer *Peer) connectToPeers() {
 				fmt.Println("connect to", p, "failed", err)
 				continue
 			}
-			defer conn.Close()
-
 			queryAllBlocks(conn)
+			MyPeer.alivePeersAddr = append(MyPeer.alivePeersAddr, p)
 		}
 	}
 }
@@ -67,8 +71,4 @@ func (peer *Peer) startServer() {
 
 		go handleConn(conn)
 	}
-}
-
-func handlerUI(w http.ResponseWriter, r *http.Request) {
-	w.Write([]byte("hello world"))
 }
