@@ -85,7 +85,7 @@ func handleConn(conn net.Conn) {
 	if err != nil {
 		fmt.Println(err)
 	}
-	fmt.Println(n, string(data[:n]))
+	//fmt.Println(n, string(data[:n]))
 
 	command := string(data[:n])
 	switch {
