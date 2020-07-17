@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"fmt"
 	"log"
 	"miniBitcoin/blockchain"
 )
@@ -10,6 +11,11 @@ func (cli *CLI) createBlockchain(address, nodeID string) {
 		log.Panic("ERROR: Address is not valid")
 	}
 
-	bd := blockchain.CreateBlockchain(address, nodeID)
-	defer bd.Db.Close()
+	bc := blockchain.CreateBlockchain(address, nodeID)
+	defer bc.Db.Close()
+
+	UTXOSet := blockchain.UTXOSet{bc}
+	UTXOSet.Reindex()
+
+	fmt.Println("Done")
 }
