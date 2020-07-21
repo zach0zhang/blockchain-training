@@ -12,6 +12,9 @@ import (
 	"runtime"
 	"sync"
 
+	"github.com/btcsuite/goleveldb/leveldb/comparer"
+	"github.com/btcsuite/goleveldb/leveldb/util"
+
 	"github.com/btcsuite/goleveldb/leveldb/iterator"
 
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
@@ -166,6 +169,155 @@ func (c *cursor) Next() bool {
 	return c.chooseIterator(true)
 }
 
+func (c *cursor) Prev() bool {
+	if err := c.bucket.tx.checkClosed(); err != nil {
+		return false
+	}
+
+	if c.currentIter == nil {
+		return false
+	}
+
+	c.currentIter.Prev()
+	return c.chooseIterator(false)
+}
+
+func (c *cursor) Seek(seek []byte) bool {
+	if err := c.bucket.tx.checkClosed(); err != nil {
+		return false
+	}
+
+	seekKey := bucketizedKey(c.bucket.id, seek)
+	c.dbIter.Seek(seekKey)
+	c.pendingIter.Seek(seekKey)
+	return c.chooseIterator(true)
+}
+
+func (c *cursor) rawKey() []byte {
+	if c.currentIter == nil {
+		return nil
+	}
+
+	return copySlice(c.currentIter.Key())
+}
+
+func (c *cursor) Key() []byte {
+	if err := c.bucket.tx.checkClosed(); err != nil {
+		return nil
+	}
+
+	if c.currentIter == nil {
+		return nil
+	}
+
+	key := c.currentIter.Key()
+	if bytes.HasPrefix(key, bucketIndexPrefix) {
+		key = key[len(bucketIndexPrefix)+4:]
+		return copySlice(key)
+	}
+
+	key = key[len(c.bucket.id):]
+	return copySlice(key)
+}
+
+func (c *cursor) rawValue() []byte {
+	// Nothing to return if cursor is exhausted.
+	if c.currentIter == nil {
+		return nil
+	}
+
+	return copySlice(c.currentIter.Value())
+}
+
+func (c *cursor) Value() []byte {
+	if err := c.bucket.tx.checkClosed(); err != nil {
+		return nil
+	}
+
+	if c.currentIter == nil {
+		return nil
+	}
+
+	if bytes.HasPrefix(c.currentIter.Key(), bucketIndexPrefix) {
+		return nil
+	}
+
+	return copySlice(c.currentIter.Value())
+}
+
+type cursorType int
+
+const (
+	// ctKeys iterates through all of the keys in a given bucket.
+	ctKeys cursorType = iota
+
+	// ctBuckets iterates through all directly nested buckets in a given
+	// bucket.
+	ctBuckets
+
+	// ctFull iterates through both the keys and the directly nested buckets
+	// in a given bucket.
+	ctFull
+)
+
+func cursorFinalizer(c *cursor) {
+	c.dbIter.Release()
+	c.pendingIter.Release()
+}
+
+// newCursor returns a new cursor for the given bucket, bucket ID, and cursor
+// type.
+func newCursor(b *bucket, bucketID []byte, cursorTyp cursorType) *cursor {
+	var dbIter, pendingIter iterator.Iterator
+	switch cursorTyp {
+	case ctKeys:
+		keyRange := util.BytesPrefix(bucketID)
+		dbIter = b.tx.snapshot.NewIterator(keyRange)
+		pendingKeyIter := newLdbTreapIter(b.tx, keyRange)
+		pendingIter = pendingKeyIter
+	case ctBuckets:
+		// The serialized bucket index key format is:
+		//   <bucketindexprefix><parentbucketid><bucketname>
+		prefix := make([]byte, len(bucketIndexPrefix)+4)
+		copy(prefix, bucketIndexPrefix)
+		copy(prefix[len(bucketIndexPrefix):], bucketID)
+		bucketRange := util.BytesPrefix(prefix)
+
+		dbIter = b.tx.snapshot.NewIterator(bucketRange)
+		pendingBucketIter := newLdbTreapIter(b.tx, bucketRange)
+		pendingIter = pendingBucketIter
+	case ctFull:
+		fallthrough
+	default:
+		// The serialized bucket index key format is:
+		//   <bucketindexprefix><parentbucketid><bucketname>
+		prefix := make([]byte, len(bucketIndexPrefix)+4)
+		copy(prefix, bucketIndexPrefix)
+		copy(prefix[len(bucketIndexPrefix):], bucketID)
+		bucketRange := util.BytesPrefix(prefix)
+		keyRange := util.BytesPrefix(bucketID)
+
+		// Since both keys and buckets are needed from the database,
+		// create an individual iterator for each prefix and then create
+		// a merged iterator from them.
+		dbKeyIter := b.tx.snapshot.NewIterator(keyRange)
+		dbBucketIter := b.tx.snapshot.NewIterator(bucketRange)
+		iters := []iterator.Iterator{dbKeyIter, dbBucketIter}
+		dbIter = iterator.NewMergedIterator(iters,
+			comparer.DefaultComparer, true)
+
+		// Since both keys and buckets are needed from the pending keys,
+		// create an individual iterator for each prefix and then create
+		// a merged iterator from them.
+		pendingKeyIter := newLdbTreapIter(b.tx, keyRange)
+		pendingBucketIter := newLdbTreapIter(b.tx, bucketRange)
+		iters = []iterator.Iterator{pendingKeyIter, pendingBucketIter}
+		pendingIter = iterator.NewMergedIterator(iters,
+			comparer.DefaultComparer, true)
+	}
+	return &cursor{bucket: b, dbIter: dbIter, pendingIter: pendingIter}
+}
+
 type bucket struct {
 	tx *transaction
 	id [4]byte
@@ -287,6 +439,12 @@ func (b *bucket) DeleteBucket(key []byte) error {
 		childIDs = childIDs[:len(childIDs)-1]
 
 		keyCursor := newCursor(b, childID, ctKeys)
+		for ok := keyCursor.First(); ok; ok = keyCursor.Next() {
+			b.tx.deleteKey(keyCursor.rawKey(), false)
+		}
+		cursorFinalizer(keyCursor)
+
+		bucketCursor := newCursor(b, childID, ctBuckets)
 		for ok := bucketCursor.First(); ok; ok = bucketCursor.Next() {
 			childID := bucketCursor.rawValue()
 			childIDs = append(childIDs, childID)
@@ -553,7 +711,7 @@ func (tx *transaction) writePendingAndCommit() error {
 	writeRow := serializeWriteRow(wc.curFIleNum, wc.curOffset)
 	if err := tx.metaBucket.Put(writeLocKeyNmae, writeRow); err != nil {
 		rollback()
-		return errors.New("failed to store write cursor" + err)
+		return errors.New(fmt.Sprintf("failed to store write cursor %s", (err)))
 	}
 
 	return tx.db.cache.commitTx(tx)
@@ -768,5 +926,5 @@ func openDB(dbPath string, create bool) (database.DB, error) {
 	cache := newDbCache(ldb, store, defaultCacheSize, defaultFlushSecs)
 	pdb := &db{store: store, cache: cache}
 
-	return reconcileDB(PDB, create)
+	return reconcileDB(pdb, create)
 }

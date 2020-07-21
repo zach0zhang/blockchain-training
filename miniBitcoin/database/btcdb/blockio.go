@@ -134,6 +134,78 @@ func blockFilePath(dbPath string, fileNum uint32) string {
 	return filepath.Join(dbPath, fileName)
 }
 
+func (s *blockStore) handleRollback(oldBlockFileNum, oldBlockOffset uint32) {
+	// Grab the write cursor mutex since it is modified throughout this
+	// function.
+	wc := s.writeCursor
+	wc.Lock()
+	defer wc.Unlock()
+
+	// Nothing to do if the rollback point is the same as the current write
+	// cursor.
+	if wc.curFileNum == oldBlockFileNum && wc.curOffset == oldBlockOffset {
+		return
+	}
+
+	// Regardless of any failures that happen below, reposition the write
+	// cursor to the old block file and offset.
+	defer func() {
+		wc.curFileNum = oldBlockFileNum
+		wc.curOffset = oldBlockOffset
+	}()
+
+	log.Debug("ROLLBACK: Rolling back to file %d, offset %d",
+		oldBlockFileNum, oldBlockOffset)
+
+	// Close the current write file if it needs to be deleted.  Then delete
+	// all files that are newer than the provided rollback file while
+	// also moving the write cursor file backwards accordingly.
+	if wc.curFileNum > oldBlockFileNum {
+		wc.curFile.Lock()
+		if wc.curFile.file != nil {
+			_ = wc.curFile.file.Close()
+			wc.curFile.file = nil
+		}
+		wc.curFile.Unlock()
+	}
+	for ; wc.curFileNum > oldBlockFileNum; wc.curFileNum-- {
+		if err := s.deleteFileFunc(wc.curFileNum); err != nil {
+			log.Warning("ROLLBACK: Failed to delete block file "+
+				"number %d: %v", wc.curFileNum, err)
+			return
+		}
+	}
+
+	// Open the file for the current write cursor if needed.
+	wc.curFile.Lock()
+	if wc.curFile.file == nil {
+		obf, err := s.openWriteFileFunc(wc.curFileNum)
+		if err != nil {
+			wc.curFile.Unlock()
+			log.Warning("ROLLBACK: %v", err)
+			return
+		}
+		wc.curFile.file = obf
+	}
+
+	// Truncate the to the provided rollback offset.
+	if err := wc.curFile.file.Truncate(int64(oldBlockOffset)); err != nil {
+		wc.curFile.Unlock()
+		log.Warning(fmt.Sprintf("ROLLBACK: Failed to truncate file %d: %v",
+			wc.curFileNum, err))
+		return
+	}
+
+	// Sync the file to disk.
+	err := wc.curFile.file.Sync()
+	wc.curFile.Unlock()
+	if err != nil {
+		log.Warning(fmt.Sprintf("ROLLBACK: Failed to sync file %d: %v",
+			wc.curFileNum, err))
+		return
+	}
+}
+
 func scanBlockFiles(dbPath string) (int, uint32) {
 	lastFile := -1
 	fileLen := uint32(0)

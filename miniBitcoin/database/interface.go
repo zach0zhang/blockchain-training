@@ -5,11 +5,13 @@ type Cursor interface {
 
 	Delete() error
 
-	Fitst() bool
+	First() bool
 
 	Last() bool
 
 	Next() bool
+
+	Prev() bool
 
 	Seek(seek []byte) bool
 
@@ -44,6 +46,10 @@ type Bucket interface {
 
 type Tx interface {
 	Metadata() Bucket
+
+	Commit() error
+
+	Rollback() error
 }
 
 type DB interface {
