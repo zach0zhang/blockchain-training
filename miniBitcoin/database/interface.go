@@ -1,5 +1,10 @@
 package database
 
+import (
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcutil"
+)
+
 type Cursor interface {
 	Bucket() Bucket
 
@@ -44,8 +49,32 @@ type Bucket interface {
 	Delete(key []byte) error
 }
 
+type BlockRegion struct {
+	Hash   *chainhash.Hash
+	Offset uint32
+	Len    uint32
+}
+
 type Tx interface {
 	Metadata() Bucket
+
+	StoreBlock(block *btcutil.Block) error
+
+	HasBlock(hash *chainhash.Hash) (bool, error)
+
+	HasBlocks(hases []chainhash.Hash) ([]bool, error)
+
+	FetchBlockHeader(hash *chainhash.Hash) ([]byte, error)
+
+	FetchBlockHeaders(hash []chainhash.Hash) ([][]byte, error)
+
+	FetchBlock(hash *chainhash.Hash) ([]byte, error)
+
+	FetchBlocks(hashes []chainhash.Hash) ([][]byte, error)
+
+	FetchBlockRegion(region *BlockRegion) ([]byte, error)
+
+	FetchBlockRegions(regions []BlockRegion) ([][]byte, error)
 
 	Commit() error
 

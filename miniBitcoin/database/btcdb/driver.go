@@ -18,6 +18,7 @@ func init() {
 		Open:      openDBDriver,
 		UseLogger: useLogger,
 	}
+	fmt.Println("init btcdb")
 	if err := database.RegisterDriver(driver); err != nil {
 		panic(fmt.Sprintf("Failed to register database driver '%s': %v", dbType, err))
 	}

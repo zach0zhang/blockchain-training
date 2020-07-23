@@ -2,11 +2,16 @@ package btcdb
 
 import (
 	"container/list"
+	"encoding/binary"
+	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
 	"sync"
+
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
 )
 
 const (
@@ -24,6 +29,10 @@ const (
 	// [4:8] File offset (4 bytes)
 	// [8:12] Block length
 	blockLocSize = 12
+)
+
+var (
+	castagnoli = crc32.MakeTable(crc32.Castagnoli)
 )
 
 type filer interface {
@@ -75,6 +84,43 @@ type blockStore struct {
 	openFileFunc      func(fileNum uint32) (*lockableFile, error)
 	openWriteFileFunc func(fileNum uint32) (filer, error)
 	deleteFileFunc    func(fileNum uint32) error
+}
+
+type blockLocation struct {
+	blockFileNum uint32
+	fileOffset   uint32
+	blockLen     uint32
+}
+
+func deserializeBlockLoc(serializedLoc []byte) blockLocation {
+	// The serialized block location format is:
+	//
+	//  [0:4]  Block file (4 bytes)
+	//  [4:8]  File offset (4 bytes)
+	//  [8:12] Block length (4 bytes)
+	return blockLocation{
+		blockFileNum: byteOrder.Uint32(serializedLoc[0:4]),
+		fileOffset:   byteOrder.Uint32(serializedLoc[4:8]),
+		blockLen:     byteOrder.Uint32(serializedLoc[8:12]),
+	}
+}
+
+func serializeBlockLoc(loc blockLocation) []byte {
+	// The serialized block location format is:
+	//
+	//  [0:4]  Block file (4 bytes)
+	//  [4:8]  File offset (4 bytes)
+	//  [8:12] Block length (4 bytes)
+	var serializedData [12]byte
+	byteOrder.PutUint32(serializedData[0:4], loc.blockFileNum)
+	byteOrder.PutUint32(serializedData[4:8], loc.fileOffset)
+	byteOrder.PutUint32(serializedData[8:12], loc.blockLen)
+	return serializedData[:]
+}
+
+func blockFilePath(dbPath string, fileNum uint32) string {
+	fileName := fmt.Sprintf(blockFilenameTemplate, fileNum)
+	return filepath.Join(dbPath, fileName)
 }
 
 // openWriteFile 返回可读可写文件句柄，若文件不存在则创建
@@ -129,9 +175,209 @@ func (s *blockStore) deleteFile(fileNum uint32) error {
 	return nil
 }
 
-func blockFilePath(dbPath string, fileNum uint32) string {
-	fileName := fmt.Sprintf(blockFilenameTemplate, fileNum)
-	return filepath.Join(dbPath, fileName)
+func (s *blockStore) blockFile(fileNum uint32) (*lockableFile, error) {
+	// When the requested block file is open for writes, return it.
+	wc := s.writeCursor
+	wc.RLock()
+	if fileNum == wc.curFileNum && wc.curFile.file != nil {
+		obf := wc.curFile
+		obf.RLock()
+		wc.RUnlock()
+		return obf, nil
+	}
+	wc.RUnlock()
+
+	// Try to return an open file under the overall files read lock.
+	s.obfMutex.RLock()
+	if obf, ok := s.openBlockFiles[fileNum]; ok {
+		s.lruMutex.Lock()
+		s.openBlocksLRU.MoveToFront(s.fileNumToLRUElem[fileNum])
+		s.lruMutex.Unlock()
+
+		obf.RLock()
+		s.obfMutex.RUnlock()
+		return obf, nil
+	}
+	s.obfMutex.RUnlock()
+
+	s.obfMutex.Lock()
+	if obf, ok := s.openBlockFiles[fileNum]; ok {
+		obf.RLock()
+		s.obfMutex.Unlock()
+		return obf, nil
+	}
+
+	// The file isn't open, so open it while potentially closing the least
+	// recently used one as needed.
+	obf, err := s.openFileFunc(fileNum)
+	if err != nil {
+		s.obfMutex.Unlock()
+		return nil, err
+	}
+	obf.RLock()
+	s.obfMutex.Unlock()
+	return obf, nil
+}
+
+func (s *blockStore) writeData(data []byte, fieldName string) error {
+	wc := s.writeCursor
+	n, err := wc.curFile.file.WriteAt(data, int64(wc.curOffset))
+	wc.curOffset += uint32(n)
+	if err != nil {
+		str := fmt.Sprintf("failed to write %s to file %d at "+
+			"offset %d: %v", fieldName, wc.curFileNum, wc.curOffset-uint32(n), err)
+		return errors.New(str)
+	}
+
+	return nil
+}
+
+// writeBlock appends the specified raw block bytes to the store's write cursor
+// location and increments it accordingly.  When the block would exceed the max
+// file size for the current flat file, this function will close the current
+// file, create the next file, update the write cursor, and write the block to
+// the new file.
+//
+// The write cursor will also be advanced the number of bytes actually written
+// in the event of failure.
+//
+// Format: <block length><serialized block><checksum>
+func (s *blockStore) writeBlock(rawBlock []byte) (blockLocation, error) {
+	blockLen := uint32(len(rawBlock))
+	fullLen := blockLen + 8
+
+	wc := s.writeCursor
+	finalOffset := wc.curOffset + fullLen
+	if finalOffset < wc.curOffset || finalOffset > s.maxBlockFileSize {
+		wc.Lock()
+		wc.curFile.Lock()
+		if wc.curFile.file != nil {
+			_ = wc.curFile.file.Close()
+			wc.curFile.file = nil
+		}
+		wc.curFile.Unlock()
+
+		wc.curFileNum++
+		wc.curOffset = 0
+		wc.Unlock()
+	}
+
+	wc.curFile.Lock()
+	defer wc.curFile.Unlock()
+
+	if wc.curFile.file == nil {
+		file, err := s.openWriteFileFunc(wc.curFileNum)
+		if err != nil {
+			return blockLocation{}, err
+		}
+		wc.curFile.file = file
+	}
+
+	origOffset := wc.curOffset
+	hasher := crc32.New(castagnoli)
+	var scratch [4]byte
+
+	// Block length
+	byteOrder.PutUint32(scratch[:], blockLen)
+	if err := s.writeData(scratch[:], "block length"); err != nil {
+		return blockLocation{}, err
+	}
+	_, _ = hasher.Write(scratch[:])
+
+	// Serialized block
+	if err := s.writeData(rawBlock[:], "block"); err != nil {
+		return blockLocation{}, err
+	}
+	_, _ = hasher.Write(rawBlock)
+
+	// checksum
+	if err := s.writeData(hasher.Sum(nil), "checksum"); err != nil {
+		return blockLocation{}, err
+	}
+
+	loc := blockLocation{
+		blockFileNum: wc.curFileNum,
+		fileOffset:   origOffset,
+		blockLen:     fullLen,
+	}
+	return loc, nil
+}
+
+// readBlock reads the specified block record and returns the serialized block.
+// It ensures the integrity of the block data by checking that the serialized
+// network matches the current network associated with the block store and
+// comparing the calculated checksum against the one stored in the flat file.
+// This function also automatically handles all file management such as opening
+// and closing files as necessary to stay within the maximum allowed open files
+// limit.
+//
+// Returns ErrDriverSpecific if the data fails to read for any reason and
+// ErrCorruption if the checksum of the read data doesn't match the checksum
+// read from the file.
+//
+// Format: <block length><serialized block><checksum>
+func (s *blockStore) readBlock(hash *chainhash.Hash, loc blockLocation) ([]byte, error) {
+	blockFile, err := s.blockFile(loc.blockFileNum)
+	if err != nil {
+		return nil, err
+	}
+
+	serializedData := make([]byte, loc.blockLen)
+	n, err := blockFile.file.ReadAt(serializedData, int64(loc.fileOffset))
+	blockFile.RUnlock()
+	if err != nil {
+		str := fmt.Sprintf("failed to read block %s from file %d, "+
+			"offset %d: %v", hash, loc.blockFileNum, loc.fileOffset, err)
+		return nil, errors.New(str)
+	}
+
+	serializedChecksum := binary.BigEndian.Uint32(serializedData[n-4:])
+	calculatedChecksum := crc32.Checksum(serializedData[:n-4], castagnoli)
+	if serializedChecksum != calculatedChecksum {
+		str := fmt.Sprintf("block data for block %s checksum "+
+			"does not match - got %x, want %x", hash, calculatedChecksum, serializedChecksum)
+		return nil, errors.New(str)
+	}
+
+	return serializedData[4 : n-4], nil
+}
+
+func (s *blockStore) readBlockRegion(loc blockLocation, offset, numBytes uint32) ([]byte, error) {
+	blockFile, err := s.blockFile(loc.blockFileNum)
+	if err != nil {
+		return nil, err
+	}
+
+	readOffset := loc.fileOffset + 4 + offset
+	serializedData := make([]byte, numBytes)
+	_, err = blockFile.file.ReadAt(serializedData, int64(readOffset))
+	blockFile.RUnlock()
+	if err != nil {
+		str := fmt.Sprintf("failed to read region from block file %d, "+
+			"offset %d, len %d: %v", loc.blockFileNum, readOffset, numBytes, err)
+		return nil, errors.New(str)
+	}
+
+	return serializedData, nil
+}
+
+func (s *blockStore) syncBlocks() error {
+	wc := s.writeCursor
+	wc.RLock()
+	defer wc.RUnlock()
+
+	wc.curFile.RLock()
+	defer wc.curFile.RUnlock()
+	if wc.curFile.file == nil {
+		return nil
+	}
+
+	if err := wc.curFile.file.Sync(); err != nil {
+		str := fmt.Sprintf("failed to sync file %d: %v", wc.curFileNum, err)
+		return errors.New(str)
+	}
+
+	return nil
 }
 
 func (s *blockStore) handleRollback(oldBlockFileNum, oldBlockOffset uint32) {
@@ -218,7 +464,7 @@ func scanBlockFiles(dbPath string) (int, uint32) {
 		lastFile = i
 		fileLen = uint32(st.Size())
 	}
-	log.Debug("Scan found latest block file #%d with length %d", lastFile, fileLen)
+	log.Debug("Scan found latest block file", lastFile, "with length", fileLen)
 	return lastFile, fileLen
 }
 
@@ -244,7 +490,7 @@ func newBlockStore(basePath string) *blockStore {
 	}
 
 	store.openFileFunc = store.openFile
-	store.openWriteFileFunc = store.openWriteFileFunc
+	store.openWriteFileFunc = store.openWriteFile
 	store.deleteFileFunc = store.deleteFile
 	return store
 }

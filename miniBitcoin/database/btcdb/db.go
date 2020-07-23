@@ -10,8 +10,12 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"sync"
 
+	"github.com/btcsuite/btcd/wire"
+
+	"github.com/btcsuite/btcutil"
 	"github.com/btcsuite/goleveldb/leveldb/comparer"
 	"github.com/btcsuite/goleveldb/leveldb/util"
 
@@ -25,9 +29,15 @@ import (
 
 const (
 	metadataDbName = "metadata"
+
+	blockHdrSize = wire.MaxBlockHeaderPayload
+
+	blockHdrOffset = blockLocSize
 )
 
 var (
+	byteOrder = binary.LittleEndian
+
 	metadataBucketID = [4]byte{}
 
 	bucketIndexPrefix = []byte("bidx")
@@ -40,6 +50,32 @@ var (
 
 	writeLocKeyNmae = []byte("btcdb-writeloc")
 )
+
+type bulkFetchData struct {
+	*blockLocation
+	replyIndex int
+}
+
+type bulkFetchDataSorter []bulkFetchData
+
+func (s bulkFetchDataSorter) Len() int {
+	return len(s)
+}
+
+func (s bulkFetchDataSorter) Swap(i, j int) {
+	s[i], s[j] = s[j], s[i]
+}
+
+func (s bulkFetchDataSorter) Less(i, j int) bool {
+	if s[i].blockFileNum < s[j].blockFileNum {
+		return true
+	}
+	if s[i].blockFileNum > s[j].blockFileNum {
+		return false
+	}
+
+	return s[i].fileOffset < s[j].fileOffset
+}
 
 func copySlice(slice []byte) []byte {
 	ret := make([]byte, len(slice))
@@ -385,7 +421,8 @@ func (b *bucket) CreateBucket(key []byte) (database.Bucket, error) {
 	if b.id == metadataBucketID && bytes.Equal(key, blockIdxBucketName) {
 		childID = blockIdxBucketID
 	} else {
-		childID, err := b.tx.nextBucketID()
+		var err error
+		childID, err = b.tx.nextBucketID()
 		if err != nil {
 			return nil, err
 		}
@@ -567,7 +604,7 @@ type transaction struct {
 	blockIdxBucket *bucket          //存储区块hash与其序号的Bucket
 
 	pendingBlocks    map[chainhash.Hash]int // 记录待提交Block的哈希与其在pendingBLockData中的位置的对应关系
-	pendingBLockData []pendingBlock         // 顺序记录所有待提交Block的字节序列
+	pendingBlockData []pendingBlock         // 顺序记录所有待提交Block的字节序列
 
 	pendingKeys   *treap.Mutable // 待添加或者更新的元数据集合
 	pendingRemove *treap.Mutable // 待删除的元数据集合
@@ -577,6 +614,27 @@ type transaction struct {
 }
 
 var _ database.Tx = (*transaction)(nil)
+
+func (tx *transaction) removeActiveIter(iter *treap.Iterator) {
+	// An indexing for loop is intentionally used over a range here as range
+	// does not reevaluate the slice on each iteration nor does it adjust
+	// the index for the modified slice.
+	tx.activeIterLock.Lock()
+	for i := 0; i < len(tx.activeIters); i++ {
+		if tx.activeIters[i] == iter {
+			copy(tx.activeIters[i:], tx.activeIters[i+1:])
+			tx.activeIters[len(tx.activeIters)-1] = nil
+			tx.activeIters = tx.activeIters[:len(tx.activeIters)-1]
+		}
+	}
+	tx.activeIterLock.Unlock()
+}
+
+func (tx *transaction) addActiveIter(iter *treap.Iterator) {
+	tx.activeIterLock.Lock()
+	tx.activeIters = append(tx.activeIters, iter)
+	tx.activeIterLock.Unlock()
+}
 
 // 当transaction已经结束时返回一个错误
 func (tx *transaction) checkClosed() error {
@@ -594,10 +652,6 @@ func (tx *transaction) notifyActiveIters() {
 	}
 	tx.activeIterLock.RUnlock()
 }
-
-/*
-未完成 snapshot
-*/
 
 func (tx *transaction) hasKey(key []byte) bool {
 	if tx.writable {
@@ -664,13 +718,13 @@ func (tx *transaction) close() {
 	tx.closed = true
 
 	tx.pendingBlocks = nil
-	tx.pendingBLockData = nil
+	tx.pendingBlockData = nil
 
 	tx.pendingKeys = nil
 	tx.pendingRemove = nil
 
 	if tx.snapshot != nil {
-		tx.snapshot.Relese()
+		tx.snapshot.Release()
 		tx.snapshot = nil
 	}
 
@@ -692,7 +746,7 @@ func (tx *transaction) writePendingAndCommit() error {
 		tx.db.store.handleRollback(oldBlkFileNUm, oldBlkOffset)
 	}
 
-	for _, blockData := range tx.pendingBLockData {
+	for _, blockData := range tx.pendingBlockData {
 		log.Debug("Storing block %s", blockData.hash)
 		location, err := tx.db.store.writeBlock(blockData.bytes)
 		if err != nil {
@@ -708,13 +762,249 @@ func (tx *transaction) writePendingAndCommit() error {
 		}
 	}
 
-	writeRow := serializeWriteRow(wc.curFIleNum, wc.curOffset)
+	writeRow := serializeWriteRow(wc.curFileNum, wc.curOffset)
 	if err := tx.metaBucket.Put(writeLocKeyNmae, writeRow); err != nil {
 		rollback()
 		return errors.New(fmt.Sprintf("failed to store write cursor %s", (err)))
 	}
 
 	return tx.db.cache.commitTx(tx)
+}
+
+func (tx *transaction) hasBlock(hash *chainhash.Hash) bool {
+	if _, exists := tx.pendingBlocks[*hash]; exists {
+		return true
+	}
+
+	return tx.hasKey(bucketizedKey(blockIdxBucketID, hash[:]))
+}
+
+func (tx *transaction) StoreBlock(block *btcutil.Block) error {
+	if err := tx.checkClosed(); err != nil {
+		return err
+	}
+
+	if !tx.writable {
+		return errors.New("store block requires a writable database transaction")
+	}
+
+	blockHash := block.Hash()
+	if tx.hasBlock(blockHash) {
+		str := fmt.Sprintf("block %s already exists", blockHash)
+		return errors.New(str)
+	}
+
+	blockBytes, err := block.Bytes()
+	if err != nil {
+		str := fmt.Sprintf("failed to get serialized bytes for blocks %s", blockHash)
+		return errors.New(str)
+	}
+
+	if tx.pendingBlocks == nil {
+		tx.pendingBlocks = make(map[chainhash.Hash]int)
+	}
+	tx.pendingBlocks[*blockHash] = len(tx.pendingBlockData)
+	tx.pendingBlockData = append(tx.pendingBlockData, pendingBlock{
+		hash:  blockHash,
+		bytes: blockBytes,
+	})
+	log.Debug("Added block %s to pending blocks", blockHash)
+
+	return nil
+}
+
+func (tx *transaction) HasBlock(hash *chainhash.Hash) (bool, error) {
+	if err := tx.checkClosed(); err != nil {
+		return false, err
+	}
+
+	return tx.hasBlock(hash), nil
+}
+
+func (tx *transaction) HasBlocks(hashes []chainhash.Hash) ([]bool, error) {
+	if err := tx.checkClosed(); err != nil {
+		return nil, err
+	}
+
+	results := make([]bool, len(hashes))
+	for i := range hashes {
+		results[i] = tx.hasBlock(&hashes[i])
+	}
+
+	return results, nil
+}
+
+func (tx *transaction) fetchBlockRow(hash *chainhash.Hash) ([]byte, error) {
+	blockRow := tx.blockIdxBucket.Get(hash[:])
+	if blockRow == nil {
+		str := fmt.Sprintf("block %s does not exist", hash)
+		return nil, errors.New(str)
+	}
+	return blockRow, nil
+}
+
+func (tx *transaction) FetchBlockHeader(hash *chainhash.Hash) ([]byte, error) {
+	return tx.FetchBlockRegion(&database.BlockRegion{
+		Hash:   hash,
+		Offset: 0,
+		Len:    blockHdrSize,
+	})
+}
+
+func (tx *transaction) FetchBlockHeaders(hashes []chainhash.Hash) ([][]byte, error) {
+	regions := make([]database.BlockRegion, len(hashes))
+	for i := range hashes {
+		regions[i].Hash = &hashes[i]
+		regions[i].Offset = 0
+		regions[i].Len = blockHdrSize
+	}
+	return tx.FetchBlockRegions(regions)
+}
+
+func (tx *transaction) FetchBlock(hash *chainhash.Hash) ([]byte, error) {
+	if err := tx.checkClosed(); err != nil {
+		return nil, err
+	}
+
+	if idx, exists := tx.pendingBlocks[*hash]; exists {
+		return tx.pendingBlockData[idx].bytes, nil
+	}
+
+	blockRow, err := tx.fetchBlockRow(hash)
+	if err != nil {
+		return nil, err
+	}
+	location := deserializeBlockLoc(blockRow)
+
+	blockBytes, err := tx.db.store.readBlock(hash, location)
+	if err != nil {
+		return nil, err
+	}
+
+	return blockBytes, nil
+}
+
+func (tx *transaction) FetchBlocks(hashes []chainhash.Hash) ([][]byte, error) {
+	if err := tx.checkClosed(); err != nil {
+		return nil, err
+	}
+
+	blocks := make([][]byte, len(hashes))
+	for i := range hashes {
+		var err error
+		blocks[i], err = tx.FetchBlock(&hashes[i])
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return blocks, nil
+}
+
+func (tx *transaction) fetchPendingRegion(region *database.BlockRegion) ([]byte, error) {
+	idx, exists := tx.pendingBlocks[*region.Hash]
+	if !exists {
+		return nil, nil
+	}
+
+	blockBytes := tx.pendingBlockData[idx].bytes
+	blockLen := uint32(len(blockBytes))
+	endOffset := region.Offset + region.Len
+	if endOffset < region.Offset || endOffset > blockLen {
+		str := fmt.Sprintf("block %s region offset %d, length %d "+
+			"exceeds block length of %d", region.Hash, region.Offset, region.Len, blockLen)
+		return nil, errors.New(str)
+	}
+
+	return blockBytes[region.Offset:endOffset:endOffset], nil
+}
+
+func (tx *transaction) FetchBlockRegion(region *database.BlockRegion) ([]byte, error) {
+	if err := tx.checkClosed(); err != nil {
+		return nil, err
+	}
+
+	if tx.pendingBlocks != nil {
+		regionBytes, err := tx.fetchPendingRegion(region)
+		if err != nil {
+			return nil, err
+		}
+		if regionBytes != nil {
+			return regionBytes, nil
+		}
+	}
+
+	blockRow, err := tx.fetchBlockRow(region.Hash)
+	if err != nil {
+		return nil, err
+	}
+	location := deserializeBlockLoc(blockRow)
+
+	endOffset := region.Offset + region.Len
+	if endOffset < region.Offset || endOffset > location.blockLen {
+		str := fmt.Sprintf("block %s region offset %d, length %d "+
+			"exceeds block length of %d", region.Hash, region.Offset, region.Len, location.blockLen)
+		return nil, errors.New(str)
+	}
+
+	regionBytes, err := tx.db.store.readBlockRegion(location, region.Offset, region.Len)
+	if err != nil {
+		return nil, err
+	}
+
+	return regionBytes, nil
+}
+func (tx *transaction) FetchBlockRegions(regions []database.BlockRegion) ([][]byte, error) {
+	if err := tx.checkClosed(); err != nil {
+		return nil, err
+	}
+
+	blockRegions := make([][]byte, len(regions))
+	fetchList := make([]bulkFetchData, 0, len(regions))
+	for i := range regions {
+		region := &regions[i]
+
+		if tx.pendingBlocks != nil {
+			regionBytes, err := tx.fetchPendingRegion(region)
+			if err != nil {
+				return nil, err
+			}
+			if regionBytes != nil {
+				blockRegions[i] = regionBytes
+				continue
+			}
+		}
+
+		blockRow, err := tx.fetchBlockRow(region.Hash)
+		if err != nil {
+			return nil, err
+		}
+		location := deserializeBlockLoc(blockRow)
+
+		endOffset := region.Offset + region.Len
+		if endOffset < region.Offset || endOffset > location.blockLen {
+			str := fmt.Sprintf("block %s region offset %d, length "+
+				"%d exceeds block length of %d", region.Hash, region.Offset, region.Len, location.blockLen)
+			return nil, errors.New(str)
+		}
+
+		fetchList = append(fetchList, bulkFetchData{&location, i})
+	}
+	sort.Sort(bulkFetchDataSorter(fetchList))
+
+	for i := range fetchList {
+		fetchData := &fetchList[i]
+		ri := fetchData.replyIndex
+		region := &regions[ri]
+		location := fetchData.blockLocation
+		regionBytes, err := tx.db.store.readBlockRegion(*location, region.Offset, region.Len)
+		if err != nil {
+			return nil, err
+		}
+		blockRegions[ri] = regionBytes
+	}
+
+	return blockRegions, nil
 }
 
 func (tx *transaction) Commit() error {
@@ -894,8 +1184,16 @@ func fileExists(name string) bool {
 }
 
 func initDB(ldb *leveldb.DB) error {
-	// batch := new(leveldb.Batch)
-	// batch.Put(bucketizedKey(metadataBucketID))
+	batch := new(leveldb.Batch)
+	batch.Put(bucketizedKey(metadataBucketID, writeLocKeyNmae), serializeWriteRow(0, 0))
+
+	batch.Put(bucketIndexKey(metadataBucketID, blockIdxBucketName), blockIdxBucketID[:])
+	batch.Put(curBucketIDKeyName, blockIdxBucketID[:])
+
+	if err := ldb.Write(batch, nil); err != nil {
+		str := fmt.Sprintf("failed to initialize metadata database: %v", err)
+		return errors.New(str)
+	}
 
 	return nil
 }
@@ -904,7 +1202,7 @@ func openDB(dbPath string, create bool) (database.DB, error) {
 	metadataDbPath := filepath.Join(dbPath, metadataDbName)
 	dbExists := fileExists(metadataDbPath)
 	if !create && !dbExists {
-		return nil, errors.New("database" + metadataDbPath + "does not exist")
+		return nil, errors.New("database " + metadataDbPath + " does not exist")
 	}
 
 	if !dbExists {

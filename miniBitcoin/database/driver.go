@@ -27,6 +27,7 @@ func RegisterDriver(driver Driver) error {
 	}
 
 	drivers[driver.DbType] = &driver
+	driver.UseLogger(log)
 	return nil
 }
 
